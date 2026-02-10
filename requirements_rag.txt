@@ -1,0 +1,10 @@
+docling
+langchain-huggingface
+langchain-chroma
+langchain-groq
+chromadb
+pydantic
+sentence-transformers
+streamlit
+python-dotenv
+tf-keras
