@@ -11,3 +11,5 @@ faiss-cpu
 chromadb
 fastapi
 uvicorn
+unstructured
+supabase
