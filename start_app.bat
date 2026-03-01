@@ -1,0 +1,9 @@
+@echo off
+echo Starting FastAPI Backend...
+start "PharmaRAG Backend" cmd /k "call .venv\Scripts\activate.bat && python api.py"
+
+echo Waiting for backend to initialize...
+timeout /t 30
+
+echo Starting Streamlit Frontend...
+streamlit run app.py
