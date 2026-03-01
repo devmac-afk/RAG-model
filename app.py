@@ -1,39 +1,41 @@
-import asyncio
-try:
-    asyncio.get_running_loop()
-except RuntimeError:
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
 
 import streamlit as st
 import os
-import shutil
+import requests
+import time
 import logging
-from pathlib import Path
 from dotenv import load_dotenv
 
-# Import our backend engine
-from pharma_rag import IngestionEngine, ChunkingEngine, VectorDatabase, RAGController
+# Import Supabase helpers
+try:
+    from supabase_client import create_chat_session, get_all_chat_sessions, delete_chat_session, get_chat_history, save_message
+except ImportError:
+    # Fallback if supabase client fails
+    def create_chat_session(*a, **k): return None
+    def get_all_chat_sessions(*a, **k): return []
+    def delete_chat_session(*a, **k): return False
+    def get_chat_history(*a, **k): return []
+    def save_message(*a, **k): return False
 
 # --- Configuration & Setup ---
 load_dotenv()
 st.set_page_config(
-    page_title="Pharma AI Assistant",
+    page_title="Pharma AI Assistant (Optimized)",
     page_icon="💊",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
+# API Configuration
+API_URL = os.getenv("API_URL", "http://localhost:8000")
+
 # Initialize Session State
 if "messages" not in st.session_state:
     st.session_state.messages = []
-if "rag_controller" not in st.session_state:
-    st.session_state.rag_controller = None
-# Code Update Hotfix: Reset controller if it doesn't have the new streaming method
-if st.session_state.rag_controller and not hasattr(st.session_state.rag_controller, 'query_stream'):
-    st.session_state.rag_controller = None
 if "processed_file" not in st.session_state:
     st.session_state.processed_file = None
+if "current_session_id" not in st.session_state:
+    st.session_state.current_session_id = None
 
 # --- Custom CSS for Premium Design ---
 st.markdown("""
@@ -75,148 +77,134 @@ st.markdown("""
         border: 1px solid #30363d;
         padding: 10px 15px;
     }
-    
-    /* Custom Headers */
-    h1, h2, h3 {
-        color: #ffffff;
-        font-weight: 600;
-        letter-spacing: 0.5px;
-    }
-    
-    /* Buttons */
-    .stButton > button {
-        background: linear-gradient(90deg, #4b6cb7 0%, #182848 100%);
-        color: white;
-        border: none;
-        padding: 0.5rem 1rem;
-        border-radius: 8px;
-        transition: all 0.3s ease;
-        font-weight: 500;
-        box-shadow: 0 4px 15px rgba(0,0,0,0.2);
-    }
-    .stButton > button:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 8px 20px rgba(0,0,0,0.4);
-    }
-
-    /* Spinner */
-    .stSpinner > div {
-        border-color: #38ef7d transparent transparent transparent;
-    }
 </style>
 """, unsafe_allow_html=True)
+
+# --- Helper Functions ---
+def check_api_health():
+    try:
+        response = requests.get(f"{API_URL}/health", timeout=2)
+        return response.status_code == 200
+    except:
+        return False
+
+def get_files():
+    try:
+        response = requests.get(f"{API_URL}/files")
+        if response.status_code == 200:
+            return response.json().get("files", [])
+    except:
+        pass
+    return []
 
 # --- Sidebar: Knowledge Base ---
 with st.sidebar:
     st.title("📂 Knowledge Base")
     
-    # --- Auto-Load / Initialize ---
-    if st.session_state.rag_controller is None:
-        if os.path.exists("./chroma_db"):
-            try:
-                # Initialize DB and Controller without new file
-                vector_db = VectorDatabase()
-                groq_api_key = os.getenv("GROQ_API_KEY")
-                if groq_api_key:
-                    st.session_state.rag_controller = RAGController(vector_db, groq_api_key)
-                    st.success("✅ Loaded Existing Knowledge Base")
-            except Exception as e:
-                st.error(f"Failed to load DB: {e}")
+    # System Status
+    api_online = check_api_health()
+    if api_online:
+        st.success("Backend API: Online 🟢")
+    else:
+        st.error("Backend API: Offline 🔴 (or still starting...)")
+        st.caption("If you used `start_app.bat`, the backend might still be loading its AI models. Wait ~30-40 seconds and click **Refresh**.")
 
     # --- File Management ---
     st.markdown("### 📚 Managed Documents")
     
-    # Helper to refresh file list
-    def get_file_list():
-        if st.session_state.rag_controller:
-            return st.session_state.rag_controller.vector_db.list_ingested_files()
-        elif os.path.exists("./chroma_db"):
-             # Temp init to get list if controller not ready (edge case)
-             temp_db = VectorDatabase()
-             return temp_db.list_ingested_files()
-        return []
+    if api_online:
+        current_files = get_files()
+        
+        if current_files:
+            for file in current_files:
+                col1, col2 = st.columns([0.8, 0.2])
+                with col1:
+                    st.caption(f"📄 {file}")
+                with col2:
+                    if st.button("🗑️", key=f"del_{file}", help=f"Delete {file}"):
+                        try:
+                            # Use source filename to delete (assuming source is filename for now)
+                            # Or we might need to be careful if source is full path
+                            # The API expects filename/source string
+                            res = requests.delete(f"{API_URL}/files/{file}")
+                            if res.status_code == 200:
+                                st.success("Deleted")
+                                time.sleep(1)
+                                st.rerun()
+                            else:
+                                st.error("Failed")
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+        else:
+            st.info("No documents found.")
 
-    current_files = get_file_list()
-    
-    if current_files:
-        for file in current_files:
-            col1, col2 = st.columns([0.8, 0.2])
-            with col1:
-                st.caption(f"📄 {os.path.basename(file)}")
-            with col2:
-                if st.button("🗑️", key=f"del_{file}", help=f"Delete {file}"):
-                    if st.session_state.rag_controller:
-                        success = st.session_state.rag_controller.vector_db.delete_file(file)
-                        if success:
-                            st.success(f"Deleted {file}")
+        st.markdown("---")
+        st.markdown("### ➕ Add New Document")
+        
+        uploaded_file = st.file_uploader("Upload PDF", type="pdf", help="Drag and drop your PDF file here.")
+        
+        if uploaded_file is not None:
+            # Check if it's already in the DB
+            current_files = get_files()
+            if uploaded_file.name in current_files:
+                st.info(f"✅ **{uploaded_file.name}** is already in the Knowledge Base.")
+            elif st.session_state.processed_file != uploaded_file.name:
+                with st.spinner(f"🚀 Processing **{uploaded_file.name}**... (This takes 30-60 secs)"):
+                    try:
+                        files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")}
+                        # Increase timeout since processing is synchronous now
+                        response = requests.post(f"{API_URL}/upload", files=files, timeout=300)
+                        
+                        if response.status_code == 200:
+                            st.session_state.processed_file = uploaded_file.name
+                            st.success(f"✅ Subscribed & processed: **{uploaded_file.name}**")
+                            time.sleep(1)
                             st.rerun()
                         else:
-                            st.error("Deletion Failed")
-    else:
-        st.info("No documents found.")
-
-    st.markdown("---")
-    st.markdown("### ➕ Add New Document")
-    
-    uploaded_file = st.file_uploader("Upload PDF", type="pdf", help="Drag and drop your PDF file here.")
-    
-    if uploaded_file is not None:
-        file_name = uploaded_file.name
+                            st.error(f"❌ Processing failed: {response.text}")
+                    except Exception as e:
+                        st.error(f"❌ Error communicating with API: {e}")
         
-        # Check if this file is already processed in this session OR in DB
-        # Note: We use the full path in DB, but filename check is a good first step
-        # Ideally we check against the list we just fetched.
-        if not any(file_name in f for f in current_files) and st.session_state.processed_file != file_name:
-             with st.spinner(f"🚀 Ingesting & Chunking **{file_name}**..."):
-                try:
-                    # Save uploaded file to temporary path
-                    save_dir = "data/temp"
-                    os.makedirs(save_dir, exist_ok=True)
-                    file_path = os.path.join(save_dir, file_name)
-                    
-                    with open(file_path, "wb") as f:
-                        f.write(uploaded_file.getbuffer())
-                    
-                    # --- BACKEND PIPELINE ---
-                    # 1. Ingestion
-                    ingestion = IngestionEngine()
-                    doc_object, _, image_map = ingestion.process_file(file_path)
-                    
-                    # 2. Chunking
-                    chunking = ChunkingEngine()
-                    chunks = chunking.chunk_document(doc_object, image_map)
-                    
-                    # 3. Embedding & Storage
-                    vector_db = VectorDatabase()
-                    vector_db.create_or_update_vector_store(chunks)
-                    
-                    # 4. Initialize Controller (if not already)
-                    groq_api_key = os.getenv("GROQ_API_KEY")
-                    
-                    if st.session_state.rag_controller is None:
-                         st.session_state.rag_controller = RAGController(vector_db, groq_api_key)
-                    
-                    # Refresh the controller's DB view just in case
-                    st.session_state.rag_controller.vector_db = vector_db
-                    
-                    st.session_state.processed_file = file_name
-                    
-                    st.success(f"✅ added to Knowledge Base!")
-                    st.rerun() # Rerun to update the file list
-                    
-                except Exception as e:
-                    st.error(f"❌ Error processing file: {e}")
-                    logging.error(f"Upload processing error: {e}")
-        elif any(file_name in f for f in current_files):
-             st.warning(f"File '{file_name}' already exists in the database.")
-    
-    st.markdown("---")
-    st.markdown("### 🤖 System Status")
-    if st.session_state.rag_controller:
-        st.success("System Ready")
-    else:
-        st.warning("Waiting for Knowledge Base...")
+        if st.button("Refresh File List"):
+            st.rerun()
 
+    else:
+        st.warning("Connect to API to manage files.")
+
+    st.markdown("---")
+    
+    # --- Chat History Management ---
+    st.markdown("### 💬 Chat History")
+    
+    if st.button("➕ New Chat", use_container_width=True):
+        st.session_state.current_session_id = None
+        st.session_state.messages = []
+        st.rerun()
+        
+    sessions = get_all_chat_sessions()
+    if sessions:
+        for s in sessions:
+            title = s.get('title') or "Chat"
+            if len(title) > 20: 
+                title = title[:17] + "..."
+                
+            cols = st.columns([0.75, 0.25])
+            with cols[0]:
+                if st.button(title, key=f"load_{s['id']}", use_container_width=True, help="Load this chat"):
+                    st.session_state.current_session_id = s['id']
+                    history = get_chat_history(s['id'])
+                    st.session_state.messages = [{"role": msg["role"], "content": msg["content"]} for msg in history]
+                    st.rerun()
+            with cols[1]:
+                if st.button("🗑️", key=f"del_{s['id']}", help="Delete this chat"):
+                    delete_chat_session(s['id'])
+                    if st.session_state.current_session_id == s['id']:
+                        st.session_state.current_session_id = None
+                        st.session_state.messages = []
+                    st.rerun()
+    else:
+        st.info("No past chats found.")
+    
     st.markdown("---")
     st.caption("Powered by Docling, ChromaDB & Groq")
 
@@ -231,84 +219,58 @@ for message in st.session_state.messages:
 
 # Chat Input
 if prompt := st.chat_input("Ask a question about the document..."):
+    # Auto-create session if none exists
+    if st.session_state.current_session_id is None:
+        title_snippet = prompt[:30] + "..." if len(prompt) > 30 else prompt
+        new_id = create_chat_session(title=title_snippet)
+        st.session_state.current_session_id = new_id
+
     # Add user message to history
     st.session_state.messages.append({"role": "user", "content": prompt})
+    if st.session_state.current_session_id:
+        save_message(st.session_state.current_session_id, "user", prompt)
+        
     with st.chat_message("user"):
         st.markdown(prompt)
 
     # Generate Response
-    if st.session_state.rag_controller:
+    if api_online:
         with st.chat_message("assistant"):
             try:
-                # Use Streaming with Self-Correction (CRAG)
-                # stream_events is a generator yielding statuses and tokens
-                stream_events = st.session_state.rag_controller.query_corrective_rag(prompt)
-                
-                # Placeholder for the final response
-                response_placeholder = st.empty()
-                full_response = ""
-                context_docs = []
-
-                # Create a status container for the reasoning steps
-                with st.status("🧠 Thinking & Verifying...", expanded=True) as status:
-                    for event in stream_events:
-                        if event["type"] == "status":
-                            # Update status container
-                            status.write(event["content"])
-                        elif event["type"] == "context":
-                            # Capture context docs for image retrieval later
-                            context_docs = event["content"]
-                        elif event["type"] == "token":
-                            # Append token to response
-                            full_response += event["content"]
-                            response_placeholder.markdown(full_response + "▌")
+                with st.spinner("🧠 Thinking & Verifying (API)..."):
+                    response = requests.post(f"{API_URL}/query", json={"question": prompt})
                     
-                    status.update(label="✅ Answer Generated", state="complete", expanded=False)
-                
-                # Final render without cursor
-                response_placeholder.markdown(full_response)
-                
-                # Save response to history
-                response = full_response
-                
-                # Add to history
-                st.session_state.messages.append({"role": "assistant", "content": response})
-                
-                # --- Image Retrieval Logic ---
-                # Check if we have extracted images for the documents in context
-                found_images = set()
-                
-                # 1. Iterate context docs and check 'images' metadata
-                for doc in context_docs:
-                    if "images" in doc.metadata and doc.metadata["images"]:
-                        # Metadata is a comma-separated string
-                        imgs = doc.metadata["images"].split(",")
-                        for img in imgs:
-                            if img.strip():
-                                found_images.add(img.strip())
-
-                if found_images:
-                    with st.expander("🖼️ Relevant Images / Figures", expanded=True):
-                        # Display as Grid of Thumbnails
-                        # We use a flexible grid
-                        cols = st.columns(4) # 4 images per row
-                        for idx, img_path in enumerate(sorted(list(found_images))):
-                            with cols[idx % 4]:
-                                # Check if file exists to be safe
-                                if os.path.exists(img_path):
-                                    st.image(
-                                        img_path, 
-                                        caption=f"Figure", 
-                                        width=150, # Thumbnail size
-                                        use_container_width=False 
-                                        # Note: clicking expands naturally in Streamlit
-                                    )
-                                else:
-                                    st.caption(f"Image not found: {os.path.basename(img_path)}")
-                            
+                    if response.status_code == 200:
+                        data = response.json()
+                        answer = data.get("answer", "No answer received.")
+                        images = data.get("images", [])
+                        
+                        st.markdown(answer)
+                        
+                        # Save response to history
+                        st.session_state.messages.append({"role": "assistant", "content": answer})
+                        if st.session_state.current_session_id:
+                            save_message(st.session_state.current_session_id, "assistant", answer)
+                        
+                        # Display Images
+                        if images:
+                            with st.expander("🖼️ Relevant Images / Figures", expanded=True):
+                                cols = st.columns(4)
+                                for idx, img_path in enumerate(sorted(images)):
+                                    with cols[idx % 4]:
+                                        if os.path.exists(img_path):
+                                             st.image(img_path, caption="Figure", width=150)
+                                        else:
+                                             # Try to handle relative path if run from different dir
+                                             # Assuming img_path is relative to app root
+                                             st.caption(f"Image: {os.path.basename(img_path)}")
+                    else:
+                        error_msg = f"API Error: {response.status_code} - {response.text}"
+                        st.error(error_msg)
+                        st.session_state.messages.append({"role": "assistant", "content": error_msg})
+            
             except Exception as e:
-                st.error(f"Error generating response: {e}")
+                st.error(f"Connection Error: {e}")
     else:
         with st.chat_message("assistant"):
-            st.warning("Please upload a document in the sidebar to start chatting.")
-            
+            st.warning("Backend API is unreachable.")
